@@ -239,6 +239,7 @@ Resources:
         ZipFile: |
             import json
             import boto3
+            from botocore.exceptions import ClientError
             APPLICABLE_RESOURCES = ['AWS::IAM::User']
 
             def evaluate_compliance(configuration_item):
@@ -250,15 +251,16 @@ Resources:
                 client = boto3.client('iam')
                 user=iam.User(user_name)
 
-                # lists all mfa devices
-                mfa = client.list_mfa_devices(UserName=user_name)
-                # evaluating compliance only for users that have password enabled '
-                if user. password_last_used is None:
-                    return 'NOT_APPLICABLE'
-                elif len(mfa['MFADevices']) > 0:
-                    return 'COMPLIANT'
-                else:
-                    return 'NON_COMPLIANT'
+                try:
+                    # evaluate IAM with password through LoginProfile
+                    login_profile = client.get_login_profile(UserName=user_name)
+                    mfa = client.list_mfa_devices(UserName=user_name)
+                    if len(mfa['MFADevices']) > 0:
+                      return 'COMPLIANT'
+                    else: return 'NON_COMPLIANT'
+                except ClientError as e:
+                    if 'NoSuchEntity' in e.response['Error']['Code']:
+                      return 'NOT_APPLICABLE'
 
             def lambda_handler(event, context):
                 invoking_event = json.loads(event['invokingEvent'])
@@ -338,11 +340,14 @@ Resources:
             import json
             import datetime
             from datetime import date
+            annotation = ''
+            from botocore.exceptions import ClientError
             APPLICABLE_RESOURCES = ['AWS::IAM::User']
             DEFAULT_AGE_THRESHOLD_IN_DAYS = 90
 
             def evaluate_compliance(configuration_item):
-
+              global annotation
+              annotation=''  
               if configuration_item['resourceType'] not in APPLICABLE_RESOURCES:
                 return 'NOT_APPLICABLE'
 
@@ -355,21 +360,37 @@ Resources:
               user_name = resource_information['configurationItems'][0]['resourceName']
               now = date(datetime.date.today().year, datetime.date.today().month, datetime.date.today().day)
               iam = boto3.client('iam')
-              user = iam.get_user(UserName=user_name)
-
-              # evaluate only users that have password enabled or have logged in at least once
-              if user['User'].get('PasswordLastUsed') is None:
-                return 'NOT_APPLICABLE'
-              else:
-                # password last used date
-                password_last_used=user['User'].get('PasswordLastUsed')
-                # calculate time since the password has been used last time
-                date_last_used=date(password_last_used.year, password_last_used.month, password_last_used.day)
-                age_in_days = 0
-                age_in_days = (now - date_last_used).days
-                if age_in_days > DEFAULT_AGE_THRESHOLD_IN_DAYS:
-                  return 'NON_COMPLIANT'
-                else: return 'COMPLIANT'
+              
+              try:
+                  # evaluate IAM Users with password through LoginProfile
+                  login_profile = iam.get_login_profile(UserName=user_name)				  
+                  # evaluate only users that have password enabled and
+                  # 1. Never logged in
+                  # 2. logged in at least once
+                  user = iam.get_user(UserName=user_name)
+                  # evaluation for user who never logged in with the password creation time
+                  if user['User'].get('PasswordLastUsed') is None:
+                    password_create_date = login_profile['LoginProfile'].get('CreateDate')
+                    date_last_used=date(password_create_date.year, password_create_date.month, password_create_date.day)
+                    age_in_days = 0
+                    age_in_days = (now - date_last_used).days
+                    if age_in_days > DEFAULT_AGE_THRESHOLD_IN_DAYS:
+                      annotation = annotation + 'Console password never used since creation and it is older than 90 days '
+                      return 'NON_COMPLIANT'
+                    else: return 'COMPLIANT'
+                    # evaluation for user who logged in with the password last used time
+                  else:
+                       password_last_used=user['User'].get('PasswordLastUsed')
+                       date_last_used=date(password_last_used.year, password_last_used.month, password_last_used.day)
+                       age_in_days = 0
+                       age_in_days = (now - date_last_used).days
+                       if age_in_days > DEFAULT_AGE_THRESHOLD_IN_DAYS:
+                         annotation = annotation + 'Console password older than 90 days '
+                         return 'NON_COMPLIANT'
+                       else: return 'COMPLIANT'
+              except ClientError as e:
+                  if 'NoSuchEntity' in e.response['Error']['Code']:
+                    return 'NOT_APPLICABLE'              
 
             def lambda_handler(event, context):
               invoking_event = json.loads(event['invokingEvent'])
